@@ -135,6 +135,57 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
     if (rl->size < HP_THRESHOLD_R)
         return;
 
+    uintptr_t *hazard_pointer = calloc(HP_MAX_THREADS*HP_MAX_HPS, sizeof(uintptr_t));
+    size_t hp_size = 0;
+    bool can_delete = false;
+
+    for(int itid=0; itid < HP_MAX_THREADS; itid++){
+        for(int ihp=hp->max_hps-1;ihp >=0; ihp--){
+            uintptr_t tmp = atomic_load(&hp->hp[itid][ihp]);
+            if(tmp){
+                for(int i=0;i<=hp_size;i++){
+                    if(tmp<=hazard_pointer[i]){
+                        continue;
+                    }else{
+                        uintptr_t k = tmp;
+                        tmp = hazard_pointer[i];
+                        hazard_pointer[i] = k;
+                    }
+                }
+                hp_size += 1;
+                hazard_pointer[hp_size] = tmp;
+            }
+        }
+    }
+    if(hp_size == 0)
+        can_delete = true;
+
+    for(size_t iret=0; iret < rl->size; iret++){
+        uintptr_t obj = rl->list[iret];
+        if(!can_delete){
+            long int middle, right = hp_size-1, left = 0;
+            while(left <= right){
+                middle = (right + left)/2;
+                if(hazard_pointer[middle] > obj){
+                    left = middle + 1;
+                }else if(hazard_pointer[middle] < obj){
+                    right = middle -1;
+                }else{
+                    can_delete = true;
+                    break;
+                }
+            }
+        }
+        if(can_delete){
+            size_t bytes = (rl->size - iret) * sizeof(rl->list[0]);
+            memmove(&rl->list[iret], &rl->list[iret + 1], bytes);
+            rl->size--;
+            hp->deletefunc((void*) obj);
+        }
+    }
+
+    free(hazard_pointer);
+    /*
     for (size_t iret = 0; iret < rl->size; iret++) {
         uintptr_t obj = rl->list[iret];
         bool can_delete = true;
@@ -154,6 +205,7 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
             hp->deletefunc((void*) obj);
         }
     }
+    */
 }
 
 #include <pthread.h>
@@ -267,7 +319,6 @@ try_again:
             /* if curr had been delete , find the node again */
             if (!atomic_compare_exchange_strong(prev, &tmp, get_unmarked(next)))
                 goto try_again;
-            list_hp_protect_release(list->hp, HP_CURR, get_unmarked(curr));
             list_hp_retire(list->hp, get_unmarked(curr));
             /* if the find function successfully delete the curr, find can continue */
             /* ERROR no release hazard pointer itself, so the thread cannot get out of list_hp_retire if the retire list is full */
