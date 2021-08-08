@@ -76,6 +76,7 @@ list_hp_t *list_hp_new(size_t max_hps, list_hp_deletefunc_t *deletefunc)
     return hp;
 }
 
+static long int still_in_hp = 0;
 /* Destroy a hazard pointer array and clean up all objects protected
  * by hazard pointers.
  */
@@ -85,6 +86,7 @@ void list_hp_destroy(list_hp_t *hp)
         free(hp->hp[i]);
         retirelist_t *rl = hp->rl[i * CLPAD];
         for (int j = 0; j < rl->size; j++) {
+            atomic_fetch_add(&still_in_hp, 1);
             void *data = (void *) rl->list[j];
             hp->deletefunc(data);
         }
@@ -92,6 +94,7 @@ void list_hp_destroy(list_hp_t *hp)
         free(rl);
     }
     free(hp);
+    fprintf(stderr, "still in retire list = %ld\n", atomic_load(&still_in_hp));
 }
 
 /* Clear all hazard pointers in the array for the current thread.
@@ -216,6 +219,7 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
 
 static atomic_uint_fast32_t deletes = 0, inserts = 0;
 static atomic_uint_fast32_t deletes_failed = 0, inserts_failed = 0;
+static atomic_uint_fast32_t deletes_success = 0, inserts_success = 0;
 
 enum { HP_NEXT = 0, HP_CURR = 1, HP_PREV };
 
@@ -265,6 +269,52 @@ static void __list_node_delete(void *arg)
 {
     list_node_t *node = (list_node_t *) arg;
     list_node_destroy(node);
+}
+
+static bool __list_find_only_two_node(list_t *list,
+                                    list_key_t *key,
+                                    atomic_uintptr_t **par_prev,
+                                    list_node_t **par_curr){
+    atomic_uintptr_t *prev = NULL;
+    list_node_t *curr = NULL;
+
+try_again:
+    /* only this time don't need to protect prev */
+    prev = &list->head;
+    curr = (list_node_t *) atomic_load(prev);
+    (void) list_hp_protect_ptr(list->hp, HP_CURR, (uintptr_t) curr);
+    /* there is new node between prev and curr or prev is marked */
+    if(atomic_load(prev) != get_unmarked(curr))
+        goto try_again;
+    while(true){
+        if(get_unmarked(curr->next) == list->tail)
+            break;
+        if(is_marked(curr->next)){
+            uintptr_t tmp = get_unmarked(curr);
+            if(atomic_compare_exchange_strong(prev, &tmp, get_unmarked(get_unmarked_node(curr)->next))){
+                list_hp_clear(list->hp);
+                list_hp_retire(list->hp, get_unmarked(curr));
+            }
+            goto try_again;
+        }else{
+            if(!(get_unmarked_node(curr)->key < *key)){
+                *par_prev = prev;
+                *par_curr = curr;
+                return ((get_unmarked_node(curr)->key) == *key);
+            }
+            prev = &get_unmarked_node(curr)->next;
+            (void) list_hp_protect_ptr(list->hp, HP_PREV, get_unmarked(curr));
+            curr = (list_node_t *) atomic_load(&get_unmarked_node(curr)->next);
+            list_hp_protect_release(list->hp, HP_CURR, get_unmarked(curr));
+            if(atomic_load(prev) != get_unmarked(curr)){
+                goto try_again;
+            }
+        }
+    }
+    *par_prev = prev;
+    *par_curr = curr;
+
+    return false;
 }
 
 static bool __list_find(list_t *list,
@@ -333,6 +383,31 @@ try_again:
     return false;
 }
 
+bool list_insert_only_two_node(list_t *list, list_key_t key)
+{
+    list_node_t *curr = NULL;
+    atomic_uintptr_t *prev = NULL;
+
+    list_node_t *node = list_node_new(key);
+
+    while (true) {
+        if (__list_find_only_two_node(list, &key, &prev, &curr)) {
+            list_node_destroy(node);
+            list_hp_clear(list->hp);
+            (void) atomic_fetch_add(&inserts_failed, 1);
+            return false;
+        }
+        atomic_store_explicit(&node->next, (uintptr_t) curr, memory_order_relaxed);
+        /* you cannot use tmp = get_unmarked(prev) because prev may insert a new node */
+        uintptr_t tmp = get_unmarked(curr);
+        if (atomic_compare_exchange_strong(prev, &tmp, (uintptr_t) node)) {
+            list_hp_clear(list->hp);
+            (void) atomic_fetch_add(&inserts_success, 1);
+            return true;
+        }
+    }
+}
+
 bool list_insert(list_t *list, list_key_t key)
 {
     list_node_t *curr = NULL, *next = NULL;
@@ -353,7 +428,38 @@ bool list_insert(list_t *list, list_key_t key)
         uintptr_t tmp = get_unmarked(curr);
         if (atomic_compare_exchange_strong(prev, &tmp, (uintptr_t) node)) {
             list_hp_clear(list->hp);
+            (void) atomic_fetch_add(&inserts_success, 1);
             return true;
+        }
+    }
+}
+
+bool list_delete_only_two_node(list_t *list, list_key_t key)
+{
+    list_node_t *curr;
+    atomic_uintptr_t *prev;
+    while (true) {
+        if (!__list_find_only_two_node(list, &key, &prev, &curr)) {
+            list_hp_clear(list->hp);
+            (void) atomic_fetch_add(&deletes_failed, 1);
+            return false;
+        }
+
+        uintptr_t tmp = get_unmarked(get_unmarked_node(curr)->next);
+        /* failed if next is not in list (curr->next is changed) */
+        if (!atomic_compare_exchange_strong(&curr->next, &tmp,
+                        get_marked(get_unmarked_node(curr)->next)))
+            continue;
+
+        tmp = get_unmarked(curr);
+        if (atomic_compare_exchange_strong(prev, &tmp, get_unmarked(get_unmarked_node(curr)->next))) {
+            list_hp_clear(list->hp);
+            list_hp_retire(list->hp, get_unmarked(curr));
+            (void) atomic_fetch_add(&deletes_success, 1);
+            return true;
+        } else {
+            list_hp_clear(list->hp);
+//            (void) atomic_fetch_add(&deletes_success, 1);
         }
     }
 }
@@ -379,9 +485,11 @@ bool list_delete(list_t *list, list_key_t key)
         if (atomic_compare_exchange_strong(prev, &tmp, get_unmarked(next))) {
             list_hp_clear(list->hp);
             list_hp_retire(list->hp, get_unmarked(curr));
+            (void) atomic_fetch_add(&deletes_success, 1);
             return true;
         } else {
             list_hp_clear(list->hp);
+            (void) atomic_fetch_add(&deletes_success, 1);
         }
     }
 }
@@ -402,31 +510,56 @@ list_t *list_new(void)
     return list;
 }
 
+
 void list_destroy(list_t *list)
 {
-    fprintf(stderr, "inserts = %zu, deletes = %zu\n", atomic_load(&inserts),
+    long int count_in_list = 0;
+    fprintf(stderr, "before destroy: inserts = %zu, deletes = %zu\n", atomic_load(&inserts),
             atomic_load(&deletes));
     assert(list);
     list_node_t *prev = (list_node_t *) atomic_load(&list->head);
     list_node_t *node = (list_node_t *) atomic_load(&prev->next);
     while (node) {
+        count_in_list++;
         list_node_destroy(prev);
         prev = node;
         node = (list_node_t *) atomic_load(&prev->next);
     }
     list_node_destroy(prev);
+    fprintf(stderr, "still in list = %ld\n", ++count_in_list);
     list_hp_destroy(list->hp);
     free(list);
 }
 
 static uintptr_t elements[MAX_THREADS + 1][N_ELEMENTS];
 
+static void *insert_thread_only_two_node(void *arg)
+{
+    list_t *list = (list_t *) arg;
+
+    for (size_t i = 0; i < N_ELEMENTS; i++)
+        (void) list_insert_only_two_node(list, (uintptr_t) &elements[tid()%32][i]);
+//        (void) list_insert(list, (uintptr_t) &elements[tid()][i]);
+    return NULL;
+}
+
 static void *insert_thread(void *arg)
 {
     list_t *list = (list_t *) arg;
 
     for (size_t i = 0; i < N_ELEMENTS; i++)
-        (void) list_insert(list, (uintptr_t) &elements[tid()][i]);
+        (void) list_insert(list, (uintptr_t) &elements[tid()%32][i]);
+//        (void) list_insert(list, (uintptr_t) &elements[tid()][i]);
+    return NULL;
+}
+
+static void *delete_thread_only_two_node(void *arg)
+{
+    list_t *list = (list_t *) arg;
+
+    for (size_t i = 0; i < N_ELEMENTS; i++)
+        (void) list_delete_only_two_node(list, (uintptr_t) &elements[tid()%32][i]);
+//        (void) list_delete(list, (uintptr_t) &elements[tid()][i]);
     return NULL;
 }
 
@@ -435,7 +568,8 @@ static void *delete_thread(void *arg)
     list_t *list = (list_t *) arg;
 
     for (size_t i = 0; i < N_ELEMENTS; i++)
-        (void) list_delete(list, (uintptr_t) &elements[tid()][i]);
+        (void) list_delete(list, (uintptr_t) &elements[tid()%32][i]);
+//        (void) list_delete(list, (uintptr_t) &elements[tid()][i]);
     return NULL;
 }
 
@@ -445,17 +579,34 @@ int main(void)
 
     pthread_t thr[N_THREADS];
 
+    /*
     for (size_t i = 0; i < N_THREADS; i++)
         pthread_create(&thr[i], NULL, (i & 1) ? delete_thread : insert_thread,
                        list);
 
     for (size_t i = 0; i < N_THREADS; i++)
         pthread_join(thr[i], NULL);
+    */
+    for(size_t i = 0;i< N_THREADS;i++){
+        if(i < N_THREADS/2){
+            pthread_create(&thr[i], NULL, insert_thread_only_two_node, list);
+//            pthread_create(&thr[i], NULL, insert_thread, list);
+        }else{
+            pthread_create(&thr[i], NULL, delete_thread_only_two_node, list);
+//            pthread_create(&thr[i], NULL, delete_thread, list);
+        }
+    }
 
+    for (size_t i = 0; i < N_THREADS; i++){
+        pthread_join(thr[i], NULL);
+    }
+
+    /*
     for (size_t i = 0; i < N_ELEMENTS; i++) {
         for (size_t j = 0; j < tid_v_base; j++)
             list_delete(list, (uintptr_t) &elements[j][i]);
     }
+    */
 
     list_destroy(list);
 
@@ -463,6 +614,8 @@ int main(void)
             atomic_load(&deletes));
     fprintf(stderr, "inserts_failed = %zu, deletes_failed = %zu\n", atomic_load(&inserts_failed),
             atomic_load(&deletes_failed));
+    fprintf(stderr, "inserts_success = %zu, deletes_success = %zu\n", atomic_load(&inserts_success),
+            atomic_load(&deletes_success));
 
     return 0;
 }

@@ -6,3 +6,5 @@ b.c
 c.c
 d.c
 tmp.c
+/test_insert_delete
+perf*
