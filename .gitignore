@@ -8,3 +8,6 @@ d.c
 tmp.c
 /test_insert_delete
 perf*
+/new_version
+script.sh
+*.diff
