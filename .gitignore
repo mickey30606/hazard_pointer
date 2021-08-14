@@ -11,3 +11,5 @@ perf*
 /new_version
 script.sh
 *.diff
+*.py
+*.txt

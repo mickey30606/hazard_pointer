@@ -18,7 +18,7 @@
 #define HP_MAX_THREADS 128
 #define HP_MAX_HPS 5 /* This is named 'K' in the HP paper */
 #define CLPAD (128 / sizeof(uintptr_t))
-#define HP_THRESHOLD_R 8 /* This is named 'R' in the HP paper */
+#define HP_THRESHOLD_R 80 /* This is named 'R' in the HP paper */
 
 /* Maximum number of retired objects per thread */
 #define HP_MAX_RETIRED (HP_MAX_THREADS * HP_MAX_HPS)
@@ -58,6 +58,7 @@ typedef struct anal_find {
 } anal_find_t;
 
 typedef struct anal_retire {
+	long int retire_times;
     long int retire_success;
     long int retire_failed;
 }anal_retire_t;
@@ -76,7 +77,8 @@ enum{
 
 enum{
     RETIRE_TRACE_success=1,
-    RETIRE_TRACE_failed=2
+    RETIRE_TRACE_failed=2,
+	RETIRE_TRACE_times=3
 };
 
 anal_ins_del_t analyze_ins_del[MAX_THREADS] = {0};
@@ -188,6 +190,7 @@ static void analyze_print(void){
         ANAL_FIND_SUM(go_retire, i);
         ANAL_FIND_SUM(travels, i);
         ANAL_FIND_SUM(go_retire_and_try_again, i);
+		ANAL_RETIRE_SUM(retire_times, i);
         ANAL_RETIRE_SUM(retire_success, i);
         ANAL_RETIRE_SUM(retire_failed, i);
         ANAL_ATM_OPS_SUM(atomic_load, i);
@@ -224,8 +227,21 @@ static void analyze_print(void){
     }
     printf("\nhp_retire()\n\n");
 #define PRINT_ANAL(ops) printf("%-30s%-20ld\n", #ops, analyze_retire[0].ops);
+	PRINT_ANAL(retire_times);
     PRINT_ANAL(retire_success);
     PRINT_ANAL(retire_failed);
+
+	/*
+	FILE *output_file = fopen("result.txt", "a");
+	if(!output_file){
+		fprintf(stderr, "Cannot open result file!!!\n");
+		return;
+	}
+	fprintf(output_file, "%-5ld %-5ld %-5ld\n", analyze_retire[0].retire_times,
+			analyze_retire[0].retire_success, analyze_retire[0].retire_failed);
+	fclose(output_file);
+	*/
+
 #undef PRINT_ANAL
     for(int i=0;i<71;i++){
         printf("=");
@@ -399,6 +415,7 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
 
     if (rl->size < HP_THRESHOLD_R)
         return;
+	RETIRE_TRACE(tid(), times);
 
     uintptr_t *hazard_pointer = calloc(HP_MAX_THREADS*HP_MAX_HPS, sizeof(uintptr_t));
     size_t hp_size = 0;
@@ -698,12 +715,17 @@ int main(void)
             list_insert(list, (uintptr_t) &elements[j][i]);
         }
     }
+	for(size_t i = 0;i< 32;i++){
+		pthread_create(&thr[i], NULL, (i%2)?(delete_thread):(insert_thread), list);
+	}
+	/*
     for(size_t i = 0;i<k;i++){
         pthread_create(&thr[i], NULL, delete_thread, list);
     }
     for(size_t i = k;i<m;i++){
         pthread_create(&thr[i], NULL, insert_thread, list);
     }
+	*/
 
     for (size_t i = 0; i < m; i++)
         pthread_join(thr[i], NULL);
